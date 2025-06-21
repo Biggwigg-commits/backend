@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+import stripe
 import os
 import logging
 from pathlib import Path
@@ -30,6 +30,7 @@ JWT_SECRET = "payme-secret-key-2025"
 
 # Stripe Setup - Fresh API Key Installation
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
+stripe.api_key = STRIPE_API_KEY
 stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY)
 
 # Create the main app
@@ -218,46 +219,55 @@ async def get_balance(current_user: User = Depends(get_current_user)):
     return {"balance": current_user.balance, "currency": "USD"}
 
 # Payment Routes - Cash App Architecture
+
 @api_router.post("/payments/add-funds")
 async def add_funds(request: AddFundsRequest, current_user: User = Depends(get_current_user)):
     if request.amount < 1:
         raise HTTPException(status_code=400, detail="Minimum amount is $1.00")
-    
-    # Create Stripe checkout session
-    origin_url = "https://6cb1da09-4669-467d-a0cd-136728a7aed1.preview.emergentagent.com"
-    
-    success_url = f"{origin_url}/app/add-funds-success?session_id={{CHECKOUT_SESSION_ID}}"
-    cancel_url = f"{origin_url}/app/dashboard"
-    
-    checkout_request = CheckoutSessionRequest(
-        amount=request.amount,
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "user_id": current_user.id,
-            "transaction_type": "add_funds",
-            "username": current_user.username
+
+    origin_url = "https://your-frontend.netlify.app"
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            mode='payment',
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'product_data': {
+                        'name': 'Add Funds to Wallet',
+                    },
+                    'unit_amount': int(request.amount * 100),
+                },
+                'quantity': 1,
+            }],
+            metadata={
+                "user_id": current_user.id,
+                "transaction_type": "add_funds",
+                "username": current_user.username
+            },
+            success_url=f"{origin_url}/app/add-funds-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{origin_url}/app/dashboard",
+        )
+
+        payment_transaction = PaymentTransaction(
+            user_id=current_user.id,
+            amount=request.amount,
+            session_id=session.id,
+            metadata={"transaction_type": "add_funds"}
+        )
+
+        await db.payment_transactions.insert_one(payment_transaction.dict())
+
+        return {
+            "checkout_url": session.url,
+            "session_id": session.id,
+            "amount": request.amount
         }
-    )
-    
-    session = await stripe_checkout.create_checkout_session(checkout_request)
-    
-    # Store payment transaction
-    payment_transaction = PaymentTransaction(
-        user_id=current_user.id,
-        amount=request.amount,
-        session_id=session.session_id,
-        metadata={"transaction_type": "add_funds"}
-    )
-    
-    await db.payment_transactions.insert_one(payment_transaction.dict())
-    
-    return {
-        "checkout_url": session.url, 
-        "session_id": session.session_id,
-        "amount": request.amount
-    }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @api_router.get("/payments/status/{session_id}")
 async def check_payment_status(session_id: str, current_user: User = Depends(get_current_user)):
