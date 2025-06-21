@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
+import stripe
 import os
 import logging
 from pathlib import Path
@@ -28,9 +28,9 @@ security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 JWT_SECRET = "payme-secret-key-2025"
 
-# Stripe Setup - Fresh API Key Installation
+# Stripe Setup
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
-stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY)
+stripe.api_key = STRIPE_API_KEY
 
 # Create the main app
 app = FastAPI(title="PayMe API", version="2.0.0")
@@ -229,83 +229,102 @@ async def add_funds(request: AddFundsRequest, current_user: User = Depends(get_c
     success_url = f"{origin_url}/app/add-funds-success?session_id={{CHECKOUT_SESSION_ID}}"
     cancel_url = f"{origin_url}/app/dashboard"
     
-    checkout_request = CheckoutSessionRequest(
-        amount=request.amount,
-        currency="usd",
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "user_id": current_user.id,
-            "transaction_type": "add_funds",
-            "username": current_user.username
+    try:
+        checkout_session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'usd',
+                    'product_data': {
+                        'name': 'Add Funds to PayMe Account',
+                        'description': f'Add ${request.amount:.2f} to your PayMe wallet',
+                    },
+                    'unit_amount': int(request.amount * 100),  # Convert to cents
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                'user_id': current_user.id,
+                'transaction_type': 'add_funds',
+                'username': current_user.username
+            }
+        )
+        
+        # Store payment transaction
+        payment_transaction = PaymentTransaction(
+            user_id=current_user.id,
+            amount=request.amount,
+            session_id=checkout_session.id,
+            metadata={"transaction_type": "add_funds"}
+        )
+        
+        await db.payment_transactions.insert_one(payment_transaction.dict())
+        
+        return {
+            "checkout_url": checkout_session.url, 
+            "session_id": checkout_session.id,
+            "amount": request.amount
         }
-    )
     
-    session = await stripe_checkout.create_checkout_session(checkout_request)
-    
-    # Store payment transaction
-    payment_transaction = PaymentTransaction(
-        user_id=current_user.id,
-        amount=request.amount,
-        session_id=session.session_id,
-        metadata={"transaction_type": "add_funds"}
-    )
-    
-    await db.payment_transactions.insert_one(payment_transaction.dict())
-    
-    return {
-        "checkout_url": session.url, 
-        "session_id": session.session_id,
-        "amount": request.amount
-    }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
 
 @api_router.get("/payments/status/{session_id}")
 async def check_payment_status(session_id: str, current_user: User = Depends(get_current_user)):
-    # Check payment status with Stripe
-    checkout_status = await stripe_checkout.get_checkout_status(session_id)
-    
-    # Find payment transaction
-    payment_transaction = await db.payment_transactions.find_one({"session_id": session_id})
-    if not payment_transaction:
-        raise HTTPException(status_code=404, detail="Payment transaction not found")
-    
-    # Update transaction status
-    await db.payment_transactions.update_one(
-        {"session_id": session_id},
-        {"$set": {
-            "status": checkout_status.status,
-            "payment_status": checkout_status.payment_status
-        }}
-    )
-    
-    # If payment successful and not already processed
-    if checkout_status.payment_status == "paid" and payment_transaction["payment_status"] != "paid":
-        amount = checkout_status.amount_total / 100  # Convert from cents
+    try:
+        # Check payment status with Stripe
+        checkout_session = stripe.checkout.Session.retrieve(session_id)
         
-        # Update user balance
-        await db.users.update_one(
-            {"id": current_user.id},
-            {"$inc": {"balance": amount}}
+        # Find payment transaction
+        payment_transaction = await db.payment_transactions.find_one({"session_id": session_id})
+        if not payment_transaction:
+            raise HTTPException(status_code=404, detail="Payment transaction not found")
+        
+        # Update transaction status
+        payment_status = "paid" if checkout_session.payment_status == "paid" else "pending"
+        
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "status": checkout_session.status,
+                "payment_status": payment_status
+            }}
         )
         
-        # Create transaction record
-        transaction = Transaction(
-            from_user_id=current_user.id,
-            amount=amount,
-            transaction_type="add_funds",
-            status="completed",
-            description="Funds added via Stripe",
-            stripe_session_id=session_id,
-            fee_amount=0.0
-        )
+        # If payment successful and not already processed
+        if checkout_session.payment_status == "paid" and payment_transaction["payment_status"] != "paid":
+            amount = checkout_session.amount_total / 100  # Convert from cents
+            
+            # Update user balance
+            await db.users.update_one(
+                {"id": current_user.id},
+                {"$inc": {"balance": amount}}
+            )
+            
+            # Create transaction record
+            transaction = Transaction(
+                from_user_id=current_user.id,
+                amount=amount,
+                transaction_type="add_funds",
+                status="completed",
+                description="Funds added via Stripe",
+                stripe_session_id=session_id,
+                fee_amount=0.0
+            )
+            
+            await db.transactions.insert_one(transaction.dict())
         
-        await db.transactions.insert_one(transaction.dict())
+        return {
+            "status": checkout_session.status,
+            "payment_status": payment_status,
+            "amount": checkout_session.amount_total / 100
+        }
     
-    return {
-        "status": checkout_status.status,
-        "payment_status": checkout_status.payment_status,
-        "amount": checkout_status.amount_total / 100
-    }
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
 
 @api_router.post("/payments/send")
 async def send_money(request: SendMoneyRequest, current_user: User = Depends(get_current_user)):
