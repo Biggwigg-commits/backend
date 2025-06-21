@@ -31,7 +31,6 @@ JWT_SECRET = "payme-secret-key-2025"
 # Stripe Setup - Fresh API Key Installation
 STRIPE_API_KEY = os.environ.get('STRIPE_API_KEY')
 stripe.api_key = STRIPE_API_KEY
-stripe_checkout = StripeCheckout(api_key=STRIPE_API_KEY)
 
 # Create the main app
 app = FastAPI(title="PayMe API", version="2.0.0")
@@ -117,11 +116,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         user_id = payload.get("user_id")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
-        
+
         user = await db.users.find_one({"id": user_id})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        
+
         return User(**user)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -129,8 +128,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Invalid token")
 
 def calculate_fee(amount: float) -> float:
-    """Calculate 0.5% fee like Cash App"""
-    return round(amount * 0.005, 2)
+    return round(amount * 0.005, 2)  # 0.5% fee calculation
 
 # API Routes - Cash App/PayPal Architecture
 @api_router.get("/")
@@ -144,39 +142,34 @@ async def health_check():
 # Authentication Routes - Production Grade
 @api_router.post("/auth/register")
 async def register(user_data: UserCreate):
-    # Validate input
     if not user_data.username or not user_data.email or not user_data.phone or not user_data.password:
         raise HTTPException(status_code=400, detail="All fields are required")
-    
-    # Clean phone number
+
     phone = user_data.phone.strip()
     if not phone.startswith('+'):
         phone = '+' + phone.lstrip('+1')
-    
-    # Check if user exists
+
     existing_user = await db.users.find_one({
         "$or": [
-            {"email": user_data.email.lower()}, 
+            {"email": user_data.email.lower()},
             {"username": user_data.username.lower()},
             {"phone": phone}
         ]
     })
     if existing_user:
         raise HTTPException(status_code=400, detail="User already exists with this email, username, or phone")
-    
-    # Create user
+
     user = User(
         username=user_data.username.strip(),
         email=user_data.email.lower().strip(),
         phone=phone,
         password_hash=hash_password(user_data.password)
     )
-    
+
     await db.users.insert_one(user.dict())
-    
-    # Create access token
+
     token = create_access_token(user.id)
-    
+
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -186,22 +179,19 @@ async def register(user_data: UserCreate):
 
 @api_router.post("/auth/login")
 async def login(login_data: UserLogin):
-    # Find user by email OR phone
     identifier = login_data.identifier.strip().lower()
-    
-    # Try to find by email first, then phone
     user = await db.users.find_one({
         "$or": [
             {"email": identifier},
             {"phone": login_data.identifier.strip()}
         ]
     })
-    
+
     if not user or not verify_password(login_data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email/phone or password")
-    
+
     token = create_access_token(user["id"])
-    
+
     return {
         "access_token": token,
         "token_type": "bearer",
@@ -209,7 +199,6 @@ async def login(login_data: UserLogin):
         "message": "Login successful"
     }
 
-# User Routes - PayPal Style
 @api_router.get("/user/profile", response_model=UserResponse)
 async def get_profile(current_user: User = Depends(get_current_user)):
     return UserResponse(**current_user.dict())
@@ -217,8 +206,6 @@ async def get_profile(current_user: User = Depends(get_current_user)):
 @api_router.get("/user/balance")
 async def get_balance(current_user: User = Depends(get_current_user)):
     return {"balance": current_user.balance, "currency": "USD"}
-
-# Payment Routes - Cash App Architecture
 
 @api_router.post("/payments/add-funds")
 async def add_funds(request: AddFundsRequest, current_user: User = Depends(get_current_user)):
@@ -268,37 +255,31 @@ async def add_funds(request: AddFundsRequest, current_user: User = Depends(get_c
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @api_router.get("/payments/status/{session_id}")
 async def check_payment_status(session_id: str, current_user: User = Depends(get_current_user)):
-    # Check payment status with Stripe
-    checkout_status = await stripe_checkout.get_checkout_status(session_id)
-    
-    # Find payment transaction
+    session = stripe.checkout.Session.retrieve(session_id)
+    status = session.get("status", "unknown")
+    payment_status = session.get("payment_status", "unpaid")
+    amount_total = session.get("amount_total", 0)
+
     payment_transaction = await db.payment_transactions.find_one({"session_id": session_id})
     if not payment_transaction:
         raise HTTPException(status_code=404, detail="Payment transaction not found")
-    
-    # Update transaction status
+
     await db.payment_transactions.update_one(
         {"session_id": session_id},
         {"$set": {
-            "status": checkout_status.status,
-            "payment_status": checkout_status.payment_status
+            "status": status,
+            "payment_status": payment_status
         }}
     )
-    
-    # If payment successful and not already processed
-    if checkout_status.payment_status == "paid" and payment_transaction["payment_status"] != "paid":
-        amount = checkout_status.amount_total / 100  # Convert from cents
-        
-        # Update user balance
+
+    if payment_status == "paid" and payment_transaction.get("payment_status") != "paid":
+        amount = amount_total / 100
         await db.users.update_one(
             {"id": current_user.id},
             {"$inc": {"balance": amount}}
         )
-        
-        # Create transaction record
         transaction = Transaction(
             from_user_id=current_user.id,
             amount=amount,
@@ -308,33 +289,28 @@ async def check_payment_status(session_id: str, current_user: User = Depends(get
             stripe_session_id=session_id,
             fee_amount=0.0
         )
-        
         await db.transactions.insert_one(transaction.dict())
-    
+
     return {
-        "status": checkout_status.status,
-        "payment_status": checkout_status.payment_status,
-        "amount": checkout_status.amount_total / 100
+        "status": status,
+        "payment_status": payment_status,
+        "amount": amount_total / 100
     }
 
 @api_router.post("/payments/send")
 async def send_money(request: SendMoneyRequest, current_user: User = Depends(get_current_user)):
-    # Validate amount
     if request.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be greater than 0")
-    
-    # Calculate fee
+
     fee = calculate_fee(request.amount)
     total_amount = request.amount + fee
-    
-    # Check if sender has sufficient balance
+
     if current_user.balance < total_amount:
         raise HTTPException(
             status_code=400, 
             detail=f"Insufficient balance. Need ${total_amount:.2f} (${request.amount:.2f} + ${fee:.2f} fee)"
         )
-    
-    # Find recipient by email OR phone
+
     identifier = request.to_identifier.strip()
     recipient = await db.users.find_one({
         "$or": [
@@ -342,14 +318,13 @@ async def send_money(request: SendMoneyRequest, current_user: User = Depends(get
             {"phone": identifier}
         ]
     })
-    
+
     if not recipient:
         raise HTTPException(status_code=404, detail="Recipient not found")
-    
+
     if recipient["id"] == current_user.id:
         raise HTTPException(status_code=400, detail="Cannot send money to yourself")
-    
-    # Create transaction
+
     transaction = Transaction(
         from_user_id=current_user.id,
         to_user_id=recipient["id"],
@@ -360,21 +335,19 @@ async def send_money(request: SendMoneyRequest, current_user: User = Depends(get
         description=request.description,
         fee_amount=fee
     )
-    
-    # Update balances
+
     await db.users.update_one(
         {"id": current_user.id},
         {"$inc": {"balance": -total_amount}}
     )
-    
+
     await db.users.update_one(
         {"id": recipient["id"]},
         {"$inc": {"balance": request.amount}}
     )
-    
-    # Save transaction
+
     await db.transactions.insert_one(transaction.dict())
-    
+
     return {
         "message": "Money sent successfully", 
         "transaction_id": transaction.id,
@@ -395,15 +368,14 @@ async def get_transactions(current_user: User = Depends(get_current_user)):
             {"to_user_id": current_user.id}
         ]
     }).sort("created_at", -1).limit(50).to_list(50)
-    
+
     return [Transaction(**transaction) for transaction in transactions]
 
-# Search users - PayPal style
 @api_router.get("/users/search")
 async def search_users(q: str, current_user: User = Depends(get_current_user)):
     if len(q) < 2:
         return []
-    
+
     users = await db.users.find({
         "$and": [
             {"id": {"$ne": current_user.id}},
@@ -414,7 +386,7 @@ async def search_users(q: str, current_user: User = Depends(get_current_user)):
             ]}
         ]
     }).limit(10).to_list(10)
-    
+
     return [{
         "id": user["id"], 
         "username": user["username"], 
